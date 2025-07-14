@@ -1,4 +1,4 @@
-# main.py
+# main.py - Supabase PostgreSQL CRM Backend
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
@@ -9,7 +9,6 @@ from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta
 import os
 import logging
-from contextlib import contextmanager
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -94,50 +93,6 @@ def get_db():
 async def startup_event():
     init_db()
 
-# --- Database Initialization ---
-def init_db():
-    """Initializes the SQLite database and creates the interactions table if it doesn't exist."""
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS interactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    agent_name TEXT,
-                    customer_id TEXT NOT NULL,
-                    task_type TEXT,
-                    task_description TEXT NOT NULL,
-                    start_time TEXT,
-                    end_time TEXT,
-                    status TEXT DEFAULT 'Pending',
-                    ai_classification TEXT,
-                    ai_reason TEXT,
-                    ai_suggestion TEXT,
-                    processed_timestamp TEXT,
-                    priority TEXT DEFAULT 'Medium',
-                    tags TEXT,
-                    notes TEXT,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    updated_at TEXT DEFAULT (datetime('now'))
-                )
-            ''')
-            
-            # Create indexes for better performance
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_customer_id ON interactions(customer_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON interactions(status)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON interactions(timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_agent_name ON interactions(agent_name)')
-            
-            conn.commit()
-            logger.info(f"Database '{DATABASE_FILE}' initialized successfully with indexes.")
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        raise HTTPException(status_code=500, detail="Database initialization failed")
-
-# Run database initialization when the application starts
-init_db()
-
 # --- Pydantic Models for Data Validation ---
 class InteractionCreate(BaseModel):
     """Model for creating a new interaction log."""
@@ -145,11 +100,11 @@ class InteractionCreate(BaseModel):
     customer_id: str = Field(..., description="Unique identifier for the customer")
     task_type: Optional[str] = Field(None, description="Type of task (e.g., Support, Sales, Billing)")
     task_description: str = Field(..., min_length=1, description="Description of the task")
-    start_time: Optional[datetime] = Field(None, description="Start time in ISO format (e.g., '2023-07-15T10:00:00')")
-    end_time: Optional[datetime] = Field(None, description="End time in ISO format (e.g., '2023-07-15T10:30:00')")
+    start_time: Optional[datetime] = Field(None, description="Start time in ISO format")
+    end_time: Optional[datetime] = Field(None, description="End time in ISO format")
     status: Optional[str] = Field("Pending", description="Current status of the interaction")
     priority: Optional[str] = Field("Medium", description="Priority level (Low, Medium, High, Urgent)")
-    tags: Optional[str] = Field(None, description="Comma-separated tags (e.g., 'urgent,escalated')")
+    tags: Optional[str] = Field(None, description="Comma-separated tags")
     notes: Optional[str] = Field(None, description="Additional notes")
 
     @validator('priority')
@@ -160,8 +115,8 @@ class InteractionCreate(BaseModel):
 
     @validator('status')
     def validate_status(cls, v):
-        if v and v not in ['Pending', 'In Progress', 'Completed', 'Cancelled', 'On Hold', 'Analyzed - Action Required', 'Analyzed - Efficient']:
-            raise ValueError('Status must be one of: Pending, In Progress, Completed, Cancelled, On Hold, Analyzed - Action Required, Analyzed - Efficient')
+        if v and v not in ['Pending', 'In Progress', 'Completed', 'Cancelled', 'On Hold']:
+            raise ValueError('Status must be one of: Pending, In Progress, Completed, Cancelled, On Hold')
         return v
 
 class InteractionUpdate(BaseModel):
@@ -189,16 +144,9 @@ class InteractionUpdate(BaseModel):
 
     @validator('status')
     def validate_status(cls, v):
-        if v and v not in ['Pending', 'In Progress', 'Completed', 'Cancelled', 'On Hold', 'Analyzed - Action Required', 'Analyzed - Efficient']:
-            raise ValueError('Status must be one of: Pending, In Progress, Completed, Cancelled, On Hold, Analyzed - Action Required, Analyzed - Efficient')
+        if v and v not in ['Pending', 'In Progress', 'Completed', 'Cancelled', 'On Hold']:
+            raise ValueError('Status must be one of: Pending, In Progress, Completed, Cancelled, On Hold')
         return v
-
-class InteractionInDB(InteractionCreate):
-    """Model representing an interaction as stored in the database, including its ID."""
-    id: int
-    timestamp: datetime
-    created_at: datetime
-    updated_at: datetime
 
 class InteractionResponse(BaseModel):
     """Response model for interactions with computed fields."""
@@ -228,14 +176,9 @@ class InteractionResponse(BaseModel):
         end = values.get('end_time')
         if start and end:
             try:
-                # Ensure start and end are datetime objects
-                if isinstance(start, str):
-                    start = datetime.fromisoformat(start)
-                if isinstance(end, str):
-                    end = datetime.fromisoformat(end)
                 return (end - start).total_seconds() / 60
             except (ValueError, TypeError):
-                logger.warning(f"Could not calculate duration for interaction {values.get('id')}. Start: {start}, End: {end}")
+                logger.warning(f"Could not calculate duration for interaction {values.get('id')}")
                 return None
         return None
 
@@ -246,7 +189,7 @@ class StatsResponse(BaseModel):
     interactions_by_priority: Dict[str, int]
     average_duration_minutes: float
     top_agents: List[Dict[str, Union[str, int]]]
-    recent_activity: List[Dict[str, Union[str, int]]] # Daily counts for last 7 days
+    recent_activity: List[Dict[str, Union[str, int]]]
 
 # --- API Endpoints ---
 
@@ -254,7 +197,6 @@ class StatsResponse(BaseModel):
 async def create_interaction(interaction: InteractionCreate, db: Session = Depends(get_db)):
     """
     Creates a new customer interaction log in the CRM.
-    Automatically adds a timestamp for creation.
     """
     try:
         # Create new interaction instance
@@ -311,6 +253,7 @@ async def create_interaction(interaction: InteractionCreate, db: Session = Depen
 
 @app.get("/interactions/", response_model=List[InteractionResponse])
 async def get_all_interactions(
+    db: Session = Depends(get_db),
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of records to return"),
     status: Optional[str] = Query(None, description="Filter by status"),
@@ -323,90 +266,107 @@ async def get_all_interactions(
     Retrieves customer interaction logs from the CRM with filtering and pagination.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        query = db.query(Interaction)
+        
+        # Apply filters
+        if status:
+            query = query.filter(Interaction.status == status)
+        
+        if priority:
+            query = query.filter(Interaction.priority == priority)
+        
+        if agent_name:
+            query = query.filter(Interaction.agent_name.ilike(f"%{agent_name}%"))
+        
+        if customer_id:
+            query = query.filter(Interaction.customer_id == customer_id)
+        
+        if search:
+            query = query.filter(
+                (Interaction.task_description.ilike(f"%{search}%")) |
+                (Interaction.notes.ilike(f"%{search}%"))
+            )
+        
+        # Add ordering and pagination
+        query = query.order_by(Interaction.created_at.desc()).offset(skip).limit(limit)
+        
+        interactions = query.all()
+        
+        # Convert to response models with duration calculation
+        response_interactions = []
+        for interaction in interactions:
+            duration_minutes = None
+            if interaction.start_time and interaction.end_time:
+                duration_minutes = (interaction.end_time - interaction.start_time).total_seconds() / 60
             
-            # Build query with filters
-            query = "SELECT * FROM interactions WHERE 1=1"
-            params = []
+            response_data = {
+                "id": interaction.id,
+                "timestamp": interaction.timestamp,
+                "agent_name": interaction.agent_name,
+                "customer_id": interaction.customer_id,
+                "task_type": interaction.task_type,
+                "task_description": interaction.task_description,
+                "start_time": interaction.start_time,
+                "end_time": interaction.end_time,
+                "status": interaction.status,
+                "priority": interaction.priority,
+                "tags": interaction.tags,
+                "notes": interaction.notes,
+                "ai_classification": interaction.ai_classification,
+                "ai_reason": interaction.ai_reason,
+                "ai_suggestion": interaction.ai_suggestion,
+                "processed_timestamp": interaction.processed_timestamp,
+                "created_at": interaction.created_at,
+                "updated_at": interaction.updated_at,
+                "duration_minutes": duration_minutes
+            }
             
-            if status:
-                query += " AND status = ?"
-                params.append(status)
-            
-            if priority:
-                query += " AND priority = ?"
-                params.append(priority)
-            
-            if agent_name:
-                query += " AND agent_name LIKE ?"
-                params.append(f"%{agent_name}%")
-            
-            if customer_id:
-                query += " AND customer_id = ?"
-                params.append(customer_id)
-            
-            if search:
-                query += " AND (task_description LIKE ? OR notes LIKE ?)"
-                search_term = f"%{search}%"
-                params.extend([search_term, search_term])
-            
-            # Add ordering and pagination
-            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            params.extend([limit, skip])
-            
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            
-            # Convert to response models with duration calculation
-            interactions = []
-            for row in rows:
-                interaction_dict = dict(row)
-                duration_minutes = None
-                
-                if interaction_dict.get('start_time') and interaction_dict.get('end_time'):
-                    try:
-                        start = datetime.fromisoformat(interaction_dict['start_time'])
-                        end = datetime.fromisoformat(interaction_dict['end_time'])
-                        duration_minutes = (end - start).total_seconds() / 60
-                    except ValueError:
-                        pass
-                
-                interaction_dict['duration_minutes'] = duration_minutes
-                interactions.append(InteractionResponse(**interaction_dict))
-            
-            return interactions
+            response_interactions.append(InteractionResponse(**response_data))
+        
+        return response_interactions
     except Exception as e:
         logger.error(f"Error retrieving interactions: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve interactions")
 
 @app.get("/interactions/{interaction_id}", response_model=InteractionResponse)
-async def get_interaction_by_id(interaction_id: int):
+async def get_interaction_by_id(interaction_id: int, db: Session = Depends(get_db)):
     """
     Retrieves a single customer interaction log by its ID.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM interactions WHERE id = ?", (interaction_id,))
-            row = cursor.fetchone()
-            
-            if row:
-                interaction_dict = dict(row)
-                duration_minutes = None
-                
-                if interaction_dict.get('start_time') and interaction_dict.get('end_time'):
-                    try:
-                        start = datetime.fromisoformat(interaction_dict['start_time'])
-                        end = datetime.fromisoformat(interaction_dict['end_time'])
-                        duration_minutes = (end - start).total_seconds() / 60
-                    except ValueError:
-                        pass
-                
-                interaction_dict['duration_minutes'] = duration_minutes
-                return InteractionResponse(**interaction_dict)
-            
+        interaction = db.query(Interaction).filter(Interaction.id == interaction_id).first()
+        
+        if not interaction:
             raise HTTPException(status_code=404, detail="Interaction not found")
+        
+        # Calculate duration
+        duration_minutes = None
+        if interaction.start_time and interaction.end_time:
+            duration_minutes = (interaction.end_time - interaction.start_time).total_seconds() / 60
+        
+        response_data = {
+            "id": interaction.id,
+            "timestamp": interaction.timestamp,
+            "agent_name": interaction.agent_name,
+            "customer_id": interaction.customer_id,
+            "task_type": interaction.task_type,
+            "task_description": interaction.task_description,
+            "start_time": interaction.start_time,
+            "end_time": interaction.end_time,
+            "status": interaction.status,
+            "priority": interaction.priority,
+            "tags": interaction.tags,
+            "notes": interaction.notes,
+            "ai_classification": interaction.ai_classification,
+            "ai_reason": interaction.ai_reason,
+            "ai_suggestion": interaction.ai_suggestion,
+            "processed_timestamp": interaction.processed_timestamp,
+            "created_at": interaction.created_at,
+            "updated_at": interaction.updated_at,
+            "duration_minutes": duration_minutes
+        }
+        
+        return InteractionResponse(**response_data)
     except HTTPException:
         raise
     except Exception as e:
@@ -414,166 +374,148 @@ async def get_interaction_by_id(interaction_id: int):
         raise HTTPException(status_code=500, detail="Failed to retrieve interaction")
 
 @app.put("/interactions/{interaction_id}", response_model=InteractionResponse)
-async def update_interaction(interaction_id: int, interaction: InteractionUpdate):
+async def update_interaction(interaction_id: int, interaction: InteractionUpdate, db: Session = Depends(get_db)):
     """
     Updates an existing customer interaction log by its ID.
-    This is where AI analysis results can be added.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Build the update query dynamically based on provided fields
-            set_clauses = []
-            values = []
-            update_data = interaction.dict(exclude_unset=True) # Only include fields that are set
-
-            if not update_data:
-                raise HTTPException(status_code=400, detail="No fields provided for update.")
-
-            # Add updated_at timestamp
-            set_clauses.append("updated_at = datetime('now')")
-            
-            for key, value in update_data.items():
-                set_clauses.append(f"{key} = ?")
-                values.append(value)
-
-            values.append(interaction_id) # Add the ID for the WHERE clause
-
-            cursor.execute(
-                f"UPDATE interactions SET {', '.join(set_clauses)} WHERE id = ?",
-                values
-            )
-            
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Interaction not found")
-            
-            conn.commit()
-
-            # Retrieve the updated record to return it
-            cursor.execute("SELECT * FROM interactions WHERE id = ?", (interaction_id,))
-            updated_interaction_data = cursor.fetchone()
-            
-            if updated_interaction_data:
-                interaction_dict = dict(updated_interaction_data)
-                duration_minutes = None
-                
-                if interaction_dict.get('start_time') and interaction_dict.get('end_time'):
-                    try:
-                        start = datetime.fromisoformat(interaction_dict['start_time'])
-                        end = datetime.fromisoformat(interaction_dict['end_time'])
-                        duration_minutes = (end - start).total_seconds() / 60
-                    except ValueError:
-                        pass
-                
-                interaction_dict['duration_minutes'] = duration_minutes
-                return InteractionResponse(**interaction_dict)
-            else:
-                raise HTTPException(status_code=500, detail="Failed to retrieve updated interaction.")
+        db_interaction = db.query(Interaction).filter(Interaction.id == interaction_id).first()
+        
+        if not db_interaction:
+            raise HTTPException(status_code=404, detail="Interaction not found")
+        
+        # Update fields if provided
+        update_data = interaction.dict(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(db_interaction, field, value)
+        
+        db_interaction.updated_at = datetime.now()
+        db.commit()
+        db.refresh(db_interaction)
+        
+        # Calculate duration
+        duration_minutes = None
+        if db_interaction.start_time and db_interaction.end_time:
+            duration_minutes = (db_interaction.end_time - db_interaction.start_time).total_seconds() / 60
+        
+        response_data = {
+            "id": db_interaction.id,
+            "timestamp": db_interaction.timestamp,
+            "agent_name": db_interaction.agent_name,
+            "customer_id": db_interaction.customer_id,
+            "task_type": db_interaction.task_type,
+            "task_description": db_interaction.task_description,
+            "start_time": db_interaction.start_time,
+            "end_time": db_interaction.end_time,
+            "status": db_interaction.status,
+            "priority": db_interaction.priority,
+            "tags": db_interaction.tags,
+            "notes": db_interaction.notes,
+            "ai_classification": db_interaction.ai_classification,
+            "ai_reason": db_interaction.ai_reason,
+            "ai_suggestion": db_interaction.ai_suggestion,
+            "processed_timestamp": db_interaction.processed_timestamp,
+            "created_at": db_interaction.created_at,
+            "updated_at": db_interaction.updated_at,
+            "duration_minutes": duration_minutes
+        }
+        
+        return InteractionResponse(**response_data)
     except HTTPException:
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f"Error updating interaction {interaction_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update interaction")
 
 @app.delete("/interactions/{interaction_id}", status_code=204)
-async def delete_interaction(interaction_id: int):
+async def delete_interaction(interaction_id: int, db: Session = Depends(get_db)):
     """
     Deletes a customer interaction log by its ID.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM interactions WHERE id = ?", (interaction_id,))
-            
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Interaction not found")
-            
-            conn.commit()
-            return {} # Return empty dict for 204 No Content
+        interaction = db.query(Interaction).filter(Interaction.id == interaction_id).first()
+        
+        if not interaction:
+            raise HTTPException(status_code=404, detail="Interaction not found")
+        
+        db.delete(interaction)
+        db.commit()
+        return {}
     except HTTPException:
         raise
     except Exception as e:
+        db.rollback()
         logger.error(f"Error deleting interaction {interaction_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete interaction")
 
-# --- Advanced Endpoints ---
-
 @app.get("/stats/", response_model=StatsResponse)
-async def get_statistics():
+async def get_statistics(db: Session = Depends(get_db)):
     """
     Retrieves comprehensive statistics about interactions.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Total interactions
-            cursor.execute("SELECT COUNT(*) FROM interactions")
-            total_interactions = cursor.fetchone()[0]
-            
-            # Interactions by status
-            cursor.execute("""
-                SELECT status, COUNT(*) as count 
-                FROM interactions 
-                GROUP BY status
-            """)
-            status_counts = {row['status']: row['count'] for row in cursor.fetchall()}
-            
-            # Interactions by priority
-            cursor.execute("""
-                SELECT priority, COUNT(*) as count 
-                FROM interactions 
-                GROUP BY priority
-            """)
-            priority_counts = {row['priority']: row['count'] for row in cursor.fetchall()}
-            
-            # Average duration
-            cursor.execute("""
-                SELECT AVG(
-                    (julianday(end_time) - julianday(start_time)) * 24 * 60
-                ) as avg_duration
-                FROM interactions 
-                WHERE start_time IS NOT NULL AND end_time IS NOT NULL
-            """)
-            avg_duration_result = cursor.fetchone()
-            average_duration_minutes = avg_duration_result[0] if avg_duration_result[0] else 0.0
-            
-            # Top agents
-            cursor.execute("""
-                SELECT agent_name, COUNT(*) as count 
-                FROM interactions 
-                WHERE agent_name IS NOT NULL
-                GROUP BY agent_name 
-                ORDER BY count DESC 
-                LIMIT 5
-            """)
-            top_agents = [{"agent_name": row['agent_name'], "count": row['count']} for row in cursor.fetchall()]
-            
-            # Recent activity (last 7 days)
-            cursor.execute("""
-                SELECT DATE(created_at) as date, COUNT(*) as count 
-                FROM interactions 
-                WHERE created_at >= datetime('now', '-7 days')
-                GROUP BY DATE(created_at)
-                ORDER BY date DESC
-            """)
-            recent_activity = [{"date": row['date'], "count": row['count']} for row in cursor.fetchall()]
-            
-            return StatsResponse(
-                total_interactions=total_interactions,
-                interactions_by_status=status_counts,
-                interactions_by_priority=priority_counts,
-                average_duration_minutes=average_duration_minutes,
-                top_agents=top_agents,
-                recent_activity=recent_activity
-            )
+        # Total interactions
+        total_interactions = db.query(Interaction).count()
+        
+        # Interactions by status
+        status_counts = db.query(Interaction.status, func.count(Interaction.id)).group_by(Interaction.status).all()
+        interactions_by_status = {status: count for status, count in status_counts}
+        
+        # Interactions by priority
+        priority_counts = db.query(Interaction.priority, func.count(Interaction.id)).group_by(Interaction.priority).all()
+        interactions_by_priority = {priority: count for priority, count in priority_counts}
+        
+        # Average duration
+        avg_duration = db.query(func.avg(
+            func.extract('epoch', Interaction.end_time - Interaction.start_time) / 60
+        )).filter(
+            Interaction.start_time.isnot(None),
+            Interaction.end_time.isnot(None)
+        ).scalar()
+        average_duration_minutes = float(avg_duration) if avg_duration else 0.0
+        
+        # Top agents
+        top_agents = db.query(
+            Interaction.agent_name,
+            func.count(Interaction.id).label('count')
+        ).filter(
+            Interaction.agent_name.isnot(None)
+        ).group_by(Interaction.agent_name).order_by(
+            func.count(Interaction.id).desc()
+        ).limit(5).all()
+        
+        top_agents_list = [{"agent_name": agent, "count": count} for agent, count in top_agents]
+        
+        # Recent activity (last 7 days)
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        recent_activity = db.query(
+            func.date(Interaction.created_at).label('date'),
+            func.count(Interaction.id).label('count')
+        ).filter(
+            Interaction.created_at >= seven_days_ago
+        ).group_by(
+            func.date(Interaction.created_at)
+        ).order_by(
+            func.date(Interaction.created_at).desc()
+        ).all()
+        
+        recent_activity_list = [{"date": str(date), "count": count} for date, count in recent_activity]
+        
+        return StatsResponse(
+            total_interactions=total_interactions,
+            interactions_by_status=interactions_by_status,
+            interactions_by_priority=interactions_by_priority,
+            average_duration_minutes=average_duration_minutes,
+            top_agents=top_agents_list,
+            recent_activity=recent_activity_list
+        )
     except Exception as e:
         logger.error(f"Error retrieving statistics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve statistics")
 
 @app.post("/interactions/bulk/", response_model=List[InteractionResponse])
-async def create_bulk_interactions(interactions: List[InteractionCreate]):
+async def create_bulk_interactions(interactions: List[InteractionCreate], db: Session = Depends(get_db)):
     """
     Creates multiple customer interactions in a single request.
     """
@@ -583,80 +525,77 @@ async def create_bulk_interactions(interactions: List[InteractionCreate]):
     if len(interactions) > 100:
         raise HTTPException(status_code=400, detail="Maximum 100 interactions per bulk request")
     
-    created_interactions = []
-    current_timestamp = datetime.now().isoformat()
-    
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        created_interactions = []
+        
+        for interaction_data in interactions:
+            db_interaction = Interaction(
+                agent_name=interaction_data.agent_name,
+                customer_id=interaction_data.customer_id,
+                task_type=interaction_data.task_type,
+                task_description=interaction_data.task_description,
+                start_time=interaction_data.start_time,
+                end_time=interaction_data.end_time,
+                status=interaction_data.status,
+                priority=interaction_data.priority,
+                tags=interaction_data.tags,
+                notes=interaction_data.notes
+            )
             
-            for interaction in interactions:
-                cursor.execute(
-                    """
-                    INSERT INTO interactions (
-                        timestamp, agent_name, customer_id, task_type, task_description,
-                        start_time, end_time, status, priority, tags, notes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        current_timestamp,
-                        interaction.agent_name,
-                        interaction.customer_id,
-                        interaction.task_type,
-                        interaction.task_description,
-                        interaction.start_time,
-                        interaction.end_time,
-                        interaction.status,
-                        interaction.priority,
-                        interaction.tags,
-                        interaction.notes,
-                    ),
-                )
-                new_id = cursor.lastrowid
-                
-                # Retrieve the created interaction
-                cursor.execute("SELECT * FROM interactions WHERE id = ?", (new_id,))
-                new_interaction_data = cursor.fetchone()
-                
-                if new_interaction_data:
-                    interaction_dict = dict(new_interaction_data)
-                    duration_minutes = None
-                    
-                    if interaction_dict.get('start_time') and interaction_dict.get('end_time'):
-                        try:
-                            start = datetime.fromisoformat(interaction_dict['start_time'])
-                            end = datetime.fromisoformat(interaction_dict['end_time'])
-                            duration_minutes = (end - start).total_seconds() / 60
-                        except ValueError:
-                            pass
-                    
-                    interaction_dict['duration_minutes'] = duration_minutes
-                    created_interactions.append(InteractionResponse(**interaction_dict))
+            db.add(db_interaction)
+            db.flush()  # Get the ID without committing
             
-            conn.commit()
-            return created_interactions
+            # Calculate duration
+            duration_minutes = None
+            if db_interaction.start_time and db_interaction.end_time:
+                duration_minutes = (db_interaction.end_time - db_interaction.start_time).total_seconds() / 60
+            
+            response_data = {
+                "id": db_interaction.id,
+                "timestamp": db_interaction.timestamp,
+                "agent_name": db_interaction.agent_name,
+                "customer_id": db_interaction.customer_id,
+                "task_type": db_interaction.task_type,
+                "task_description": db_interaction.task_description,
+                "start_time": db_interaction.start_time,
+                "end_time": db_interaction.end_time,
+                "status": db_interaction.status,
+                "priority": db_interaction.priority,
+                "tags": db_interaction.tags,
+                "notes": db_interaction.notes,
+                "ai_classification": db_interaction.ai_classification,
+                "ai_reason": db_interaction.ai_reason,
+                "ai_suggestion": db_interaction.ai_suggestion,
+                "processed_timestamp": db_interaction.processed_timestamp,
+                "created_at": db_interaction.created_at,
+                "updated_at": db_interaction.updated_at,
+                "duration_minutes": duration_minutes
+            }
+            
+            created_interactions.append(InteractionResponse(**response_data))
+        
+        db.commit()
+        return created_interactions
     except Exception as e:
+        db.rollback()
         logger.error(f"Error creating bulk interactions: {e}")
         raise HTTPException(status_code=500, detail="Failed to create bulk interactions")
 
 @app.get("/health/")
-async def health_check():
+async def health_check(db: Session = Depends(get_db)):
     """
     Health check endpoint for monitoring.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM interactions")
-            interaction_count = cursor.fetchone()[0]
-            
-            return {
-                "status": "healthy",
-                "timestamp": datetime.now().isoformat(),
-                "database": "connected",
-                "total_interactions": interaction_count,
-                "version": "1.0.0"
-            }
+        interaction_count = db.query(Interaction).count()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "database": "connected",
+            "total_interactions": interaction_count,
+            "version": "1.0.0"
+        }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail="Service unhealthy")
@@ -664,51 +603,57 @@ async def health_check():
 @app.get("/search/", response_model=List[InteractionResponse])
 async def search_interactions(
     q: str = Query(..., description="Search query"),
-    limit: int = Query(50, ge=1, le=100, description="Maximum results to return")
+    limit: int = Query(50, ge=1, le=100, description="Maximum results to return"),
+    db: Session = Depends(get_db)
 ):
     """
     Full-text search across interactions.
     """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        query = db.query(Interaction).filter(
+            (Interaction.task_description.ilike(f"%{q}%")) |
+            (Interaction.notes.ilike(f"%{q}%")) |
+            (Interaction.customer_id.ilike(f"%{q}%")) |
+            (Interaction.agent_name.ilike(f"%{q}%"))
+        ).order_by(Interaction.created_at.desc()).limit(limit)
+        
+        interactions = query.all()
+        
+        response_interactions = []
+        for interaction in interactions:
+            duration_minutes = None
+            if interaction.start_time and interaction.end_time:
+                duration_minutes = (interaction.end_time - interaction.start_time).total_seconds() / 60
             
-            # Search in multiple fields
-            query = """
-                SELECT * FROM interactions 
-                WHERE task_description LIKE ? 
-                   OR notes LIKE ? 
-                   OR customer_id LIKE ? 
-                   OR agent_name LIKE ?
-                ORDER BY created_at DESC 
-                LIMIT ?
-            """
-            search_term = f"%{q}%"
-            cursor.execute(query, [search_term, search_term, search_term, search_term, limit])
-            rows = cursor.fetchall()
+            response_data = {
+                "id": interaction.id,
+                "timestamp": interaction.timestamp,
+                "agent_name": interaction.agent_name,
+                "customer_id": interaction.customer_id,
+                "task_type": interaction.task_type,
+                "task_description": interaction.task_description,
+                "start_time": interaction.start_time,
+                "end_time": interaction.end_time,
+                "status": interaction.status,
+                "priority": interaction.priority,
+                "tags": interaction.tags,
+                "notes": interaction.notes,
+                "ai_classification": interaction.ai_classification,
+                "ai_reason": interaction.ai_reason,
+                "ai_suggestion": interaction.ai_suggestion,
+                "processed_timestamp": interaction.processed_timestamp,
+                "created_at": interaction.created_at,
+                "updated_at": interaction.updated_at,
+                "duration_minutes": duration_minutes
+            }
             
-            interactions = []
-            for row in rows:
-                interaction_dict = dict(row)
-                duration_minutes = None
-                
-                if interaction_dict.get('start_time') and interaction_dict.get('end_time'):
-                    try:
-                        start = datetime.fromisoformat(interaction_dict['start_time'])
-                        end = datetime.fromisoformat(interaction_dict['end_time'])
-                        duration_minutes = (end - start).total_seconds() / 60
-                    except ValueError:
-                        pass
-                
-                interaction_dict['duration_minutes'] = duration_minutes
-                interactions.append(InteractionResponse(**interaction_dict))
-            
-            return interactions
+            response_interactions.append(InteractionResponse(**response_data))
+        
+        return response_interactions
     except Exception as e:
         logger.error(f"Error searching interactions: {e}")
         raise HTTPException(status_code=500, detail="Failed to search interactions")
 
-# --- Root Endpoint ---
 @app.get("/")
 async def root():
     """
@@ -725,11 +670,4 @@ async def root():
             "search": "/search/",
             "bulk_create": "/interactions/bulk/"
         }
-    }
-
-# Example of how to run this locally:
-# 1. Save the code above as `main.py`
-# 2. Open your terminal in the same directory
-# 3. Install dependencies: `pip install -r requirements.txt`
-# 4. Run the application: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
-# 5. Access the API documentation at: http://127.0.0.1:8000/docs 
+    } 
