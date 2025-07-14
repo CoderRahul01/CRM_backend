@@ -41,4 +41,6 @@ fastapi-cli==0.0.8
 fastapi-cloud-cli==0.1.4
 rignore==0.6.2
 sentry-sdk==2.32.0
-shellingham==1.5.4 
+shellingham==1.5.4
+sqlalchemy
+psycopg2-binary
